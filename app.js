@@ -63,11 +63,10 @@ const data = {
 const saveSettings = () => LS.set('cc.settings', settings);
 const saveData = () => LS.set('cc.data', data);
 
-const now0 = new Date();
 const state = {
-  tab: '', y: now0.getFullYear(), m: now0.getMonth(), sel: todayStr(), filter: 'all',
+  tab: '', sel: todayStr(), focus: '', filter: 'all',
   trip: null, tripSeg: 'plan', tripDay: 0,
-  anim: { month: '', sel: false, list: false },
+  anim: { list: false },
 };
 
 const other = () => (settings.me === 'a' ? 'b' : 'a');
@@ -374,6 +373,7 @@ function render() {
   if (state.tab === 'cal') renderCal();
   else if (state.tab === 'trips') renderTrips();
   if (state.trip) renderTrip();
+  if (sheetEl && sheetCtx && sheetCtx.day) $('.sheet-body', sheetEl).innerHTML = daySheetHTML(sheetCtx.day); // 열려 있는 하루 일정도 실시간 반영
 }
 function renderHeader() {
   const p = data.profile, me = settings.me, ot = other();
@@ -395,6 +395,8 @@ function switchTab(tab) {
   const prev = TABS.indexOf(state.tab), next = TABS.indexOf(tab);
   if (next < 0) return;
   const changed = state.tab !== tab;
+  const main = $('#main');
+  if (changed && state.tab === 'cal') cal.scroll = main.scrollTop; // 달력 스크롤 위치 기억
   state.tab = tab;
   TABS.forEach(t => {
     const v = $('#view-' + t);
@@ -404,8 +406,17 @@ function switchTab(tab) {
   $('#tabbar').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('.tab-ind').style.setProperty('--i', next);
   $('#fab').classList.toggle('hide', !(tab === 'cal' || tab === 'trips'));
-  if (changed) $('#main').scrollTop = 0;
-  if (tab === 'cal') renderCal();
+  if (changed) main.scrollTop = 0;
+  if (tab === 'cal') {
+    const focus = state.focus;
+    state.focus = '';
+    renderCal();
+    if (changed) {
+      if (cal.scroll == null) gotoMonth(todayStr(), false); else main.scrollTop = cal.scroll;
+      updateCalTitle();
+    }
+    if (focus) revealDay(focus);
+  }
   else if (tab === 'trips') renderTrips();
   else if (tab === 'date') enterDate();
   else renderSettings();
@@ -433,76 +444,304 @@ function eventsByDate(from, to) {
 }
 const validTrips = () => Object.values(data.trips).filter(t => t && isYmd(t.start) && isYmd(t.end));
 
-function renderCal() {
-  const first = new Date(state.y, state.m, 1);
-  const gridStart = ymd(new Date(state.y, state.m, 1 - first.getDay()));
-  const total = Math.ceil((first.getDay() + new Date(state.y, state.m + 1, 0).getDate()) / 7) * 7; // 필요한 주 수만큼만
-  const gridEnd = addDays(gridStart, total - 1);
-  const map = eventsByDate(gridStart, gridEnd);
-  const trips = validTrips().filter(t => t.end >= gridStart && t.start <= gridEnd);
-  const today = todayStr();
-  const monthKey = `${state.y}-${pad(state.m + 1)}`;
+/* ----- 공휴일 (기기에서 직접 계산: 인터넷 불필요) ----- */
+const LUNAR_FALLBACK = { // 음력 계산을 지원하지 않는 브라우저용
+  seol: { 2025: '01-29', 2026: '02-17', 2027: '02-07', 2028: '01-27', 2029: '02-13', 2030: '02-03' },
+  buddha: { 2025: '05-05', 2026: '05-24', 2027: '05-13', 2028: '05-02', 2029: '05-20', 2030: '05-09' },
+  chuseok: { 2025: '10-06', 2026: '09-25', 2027: '09-15', 2028: '10-03', 2029: '09-22', 2030: '09-12' },
+};
+const EXTRA_HOLIDAYS = { '2026-06-03': '지방선거', '2028-04-12': '국회의원선거' };
+const lunarFmt = (() => {
+  for (const c of ['dangi', 'chinese']) {
+    try {
+      const f = new Intl.DateTimeFormat('en-u-ca-' + c, { month: 'numeric', day: 'numeric' });
+      if (f.resolvedOptions().calendar === c) return f;
+    } catch (e) { /* 다음 후보 */ }
+  }
+  return null;
+})();
+function lunarDate(y, key, lunarMD, m0, d0) { // 음력 lunarMD('1-1' 등)에 해당하는 양력 날짜
+  if (lunarFmt) {
+    try {
+      for (let i = 0; i < 50; i++) {
+        const dt = new Date(y, m0, d0 + i, 12);
+        let m = '', d = '';
+        lunarFmt.formatToParts(dt).forEach(p => { if (p.type === 'month') m = p.value; else if (p.type === 'day') d = p.value; });
+        if (m + '-' + d === lunarMD) return ymd(dt); // 윤달은 '6bis'처럼 나와서 자동 제외
+      }
+    } catch (e) { /* 아래 표 사용 */ }
+  }
+  const fb = LUNAR_FALLBACK[key][y];
+  return fb ? y + '-' + fb : '';
+}
+const holCache = {};
+function holidaysOf(y) {
+  if (holCache[y]) return holCache[y];
+  const list = []; // r: 'w' 토·일이면 대체, 's' 일요일이면 대체
+  const add = (d, n, r) => list.push({ d, n, r: r || '' });
+  add(y + '-01-01', '새해');
+  add(y + '-03-01', '삼일절', 'w');
+  add(y + '-05-01', '노동절');
+  add(y + '-05-05', '어린이날', 'w');
+  add(y + '-06-06', '현충일');
+  if (y >= 2026) add(y + '-07-17', '제헌절');
+  add(y + '-08-15', '광복절', 'w');
+  add(y + '-10-03', '개천절', 'w');
+  add(y + '-10-09', '한글날', 'w');
+  add(y + '-12-25', '성탄절', 'w');
+  const seol = lunarDate(y, 'seol', '1-1', 0, 20);
+  const buddha = lunarDate(y, 'buddha', '4-8', 3, 25);
+  const chuseok = lunarDate(y, 'chuseok', '8-15', 8, 5);
+  if (seol) [-1, 0, 1].forEach(o => add(addDays(seol, o), o ? '설날 연휴' : '설날', 's'));
+  if (buddha) add(buddha, '부처님오신날', 'w');
+  if (chuseok) [-1, 0, 1].forEach(o => add(addDays(chuseok, o), o ? '추석 연휴' : '추석', 's'));
 
+  const map = {}, byDate = {};
+  list.forEach(h => {
+    map[h.d] = map[h.d] ? map[h.d] + '·' + h.n : h.n;
+    (byDate[h.d] || (byDate[h.d] = [])).push(h);
+  });
+  Object.keys(EXTRA_HOLIDAYS).forEach(d => { if (d.slice(0, 4) === String(y) && !map[d]) map[d] = EXTRA_HOLIDAYS[d]; });
+  // 대체공휴일: 해당 공휴일 다음의 첫 평일(다른 공휴일 제외)
+  Object.keys(byDate).sort().forEach(d => {
+    const hs = byDate[d], dow = parseYmd(d).getDay();
+    const need = hs.some(h => (h.r === 'w' && (dow === 0 || dow === 6)) || (h.r === 's' && dow === 0))
+      || (hs.length > 1 && hs.some(h => h.r === 's' || h.n === '어린이날'));
+    if (!need) return;
+    let s = addDays(d, 1);
+    for (let i = 0; i < 10 && (map[s] || parseYmd(s).getDay() === 0 || parseYmd(s).getDay() === 6); i++) s = addDays(s, 1);
+    map[s] = '대체공휴일';
+  });
+  return (holCache[y] = map);
+}
+const holidayName = d => (isYmd(d) ? holidaysOf(Number(d.slice(0, 4)))[d] || '' : '');
+
+/* ----- 세로 스크롤 달력 ----- */
+const cal = { built: false, from: 0, to: -1, bFrom: 0, bTo: -1, els: {}, html: {}, io: null, ttl: '', cur: null, scroll: null, ticking: false };
+const mIdx = d => { const p = parseYmd(d); return p.getFullYear() * 12 + p.getMonth(); };
+const idxFirst = i => ymd(new Date(Math.floor(i / 12), i % 12, 1));
+const idxLast = i => ymd(new Date(Math.floor(i / 12), i % 12 + 1, 0));
+const topIn = el => { const main = $('#main'); return el.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop; };
+const calTopH = () => { const t = $('.cal-top'); return t ? t.offsetHeight : 0; };
+
+function monthHTML(idx, map, trips, today) {
+  const y = Math.floor(idx / 12), m = idx % 12;
+  const lead = new Date(y, m, 1).getDay(), days = new Date(y, m + 1, 0).getDate();
+  const hol = holidaysOf(y);
   let cells = '';
-  for (let i = 0; i < total; i++) {
-    const d = addDays(gridStart, i);
+  for (let i = 0; i < lead; i++) cells += '<i class="cell blank"></i>';
+  for (let n = 1; n <= days; n++) {
+    const d = `${y}-${pad(m + 1)}-${pad(n)}`;
     const evs = map[d] || [];
     const cover = trips.filter(t => t.start <= d && d <= t.end);
-    const cls = ['cell', 'd' + (i % 7)];
-    if (d.slice(0, 7) !== monthKey) cls.push('out');
+    const h = hol[d] || '';
+    const cls = ['cell', 'd' + ((lead + n - 1) % 7)];
+    if (h) cls.push('hol');
     if (d === today) cls.push('today');
-    if (d === state.sel) { cls.push('sel'); if (state.anim.sel) cls.push('pop'); }
-    const shown = evs.length > 3 ? evs.slice(0, 2) : evs.slice(0, 3);
+    if (d === state.sel) cls.push('sel');
+    const room = h ? 2 : 3; // 공휴일 이름이 한 줄을 차지
+    const shown = evs.length > room ? evs.slice(0, room - 1) : evs;
     const pills = shown.map(e => `<span class="pill ${ownerCls(e.owner)}">${e.type === 'date' ? '♥' : ''}${esc(e.title)}</span>`).join('');
     const more = evs.length > shown.length ? `<span class="more">+${evs.length - shown.length}</span>` : '';
     const band = cover.length
       ? `<i class="tripband${cover.some(t => t.start === d) ? ' s' : ''}${cover.some(t => t.end === d) ? ' e' : ''}"></i>` : '';
-    cells += `<button type="button" class="${cls.join(' ')}" data-action="pick-day" data-date="${d}" aria-label="${fmtMD(d)} 일정 ${evs.length}개"><span class="num">${parseYmd(d).getDate()}</span>${pills}${more}${band}</button>`;
+    cells += `<button type="button" class="${cls.join(' ')}" data-action="pick-day" data-date="${d}" aria-label="${fmtMD(d)}${h ? ' ' + esc(h) : ''} 일정 ${evs.length}개"><span class="num">${n}</span>${h ? `<span class="hname">${esc(h)}</span>` : ''}${pills}${more}${band}</button>`;
   }
+  return `<h3 class="m-title"><b>${m + 1}</b>월<small>${y}</small></h3><div class="grid">${cells}</div>`;
+}
 
+function renderCal() {
+  if (!cal.built) {
+    const t = mIdx(todayStr());
+    cal.from = t - 12; cal.to = t + 18;
+    $('#view-cal').innerHTML = `
+      <div class="cal-top">
+        <div class="cal-head">
+          <button type="button" class="cal-title" data-action="today" aria-label="오늘로 이동"><span id="cal-ttl"></span></button>
+          <button type="button" class="btn sm ghost" data-action="today">오늘</button>
+        </div>
+        <div class="chips" id="cal-chips"></div>
+        <div class="dow-row">${DOW.map(d => `<span>${d}</span>`).join('')}</div>
+      </div>
+      <div id="months"></div>`;
+    cal.built = true;
+    if ('IntersectionObserver' in window) {
+      document.documentElement.classList.add('io');
+      cal.io = new IntersectionObserver(es => es.forEach(e => {
+        if (e.isIntersecting) { e.target.classList.add('seen'); cal.io.unobserve(e.target); }
+      }), { root: $('#main'), rootMargin: '0px 0px -6% 0px' });
+    }
+  }
   const me = settings.me, ot = other();
   const fchip = (v, label, cls) => `<button type="button" class="chip ${cls} ${state.filter === v ? 'on' : ''}" data-action="filter" data-v="${v}">${v === 'all' ? '' : '<i></i>'}${esc(label)}</button>`;
-  const selEvs = map[state.sel] || eventsByDate(state.sel, state.sel)[state.sel] || [];
-  const selTrips = validTrips().filter(t => t.start <= state.sel && state.sel <= t.end);
-  const rows = selTrips.map(t => `
+  const chips = fchip('all', '전체', '') + fchip(me, nameOf(me), 'o-' + me) + fchip(ot, nameOf(ot), 'o-' + ot) + fchip('both', '함께', 'o-both');
+  if (cal.chips !== chips) { $('#cal-chips').innerHTML = chips; cal.chips = chips; }
+
+  const box = $('#months');
+  const fromD = idxFirst(cal.from), toD = idxLast(cal.to);
+  const map = eventsByDate(fromD, toD);
+  const trips = validTrips().filter(t => t.end >= fromD && t.start <= toD);
+  const today = todayStr();
+  const hadAny = cal.bTo >= cal.bFrom, oldFrom = cal.bFrom;
+  for (let i = cal.from; i <= cal.to; i++) {
+    let el = cal.els[i];
+    if (!el) {
+      el = document.createElement('section');
+      el.className = 'month';
+      box.insertBefore(el, hadAny && i < oldFrom ? cal.els[oldFrom] : null);
+      cal.els[i] = el;
+      if (cal.io) cal.io.observe(el);
+    }
+    const html = monthHTML(i, map, trips, today);
+    if (cal.html[i] !== html) { el.innerHTML = html; cal.html[i] = html; } // 바뀐 달만 다시 그림
+  }
+  cal.bFrom = cal.from; cal.bTo = cal.to;
+  updateCalTitle();
+  if (state.focus && state.tab === 'cal') { const d = state.focus; state.focus = ''; revealDay(d); }
+}
+
+function updateCalTitle() {
+  if (!cal.built || state.tab !== 'cal') return;
+  const line = $('#main').scrollTop + calTopH() + 40;
+  let cur = cal.from;
+  for (let i = cal.from; i <= cal.to; i++) {
+    const el = cal.els[i];
+    if (el && topIn(el) <= line) cur = i; else break;
+  }
+  const txt = `${Math.floor(cur / 12)}년 ${cur % 12 + 1}월`;
+  if (txt === cal.ttl) return;
+  const el = $('#cal-ttl');
+  el.textContent = txt;
+  if (cal.ttl) {
+    el.classList.remove('up', 'dn');
+    void el.offsetWidth;
+    el.classList.add(cal.cur != null && cur < cal.cur ? 'dn' : 'up');
+  }
+  cal.ttl = txt; cal.cur = cur;
+}
+
+function growCal(dir) { // 스크롤이 끝에 가까워지면 6개월씩 이어 붙임
+  const main = $('#main'), box = $('#months');
+  if (dir < 0) {
+    if (cal.from <= 1900 * 12) return;
+    const h = box.offsetHeight;
+    cal.from -= 6;
+    renderCal();
+    main.scrollTop += box.offsetHeight - h; // 위에 붙인 만큼 보정해서 화면이 튀지 않게
+  } else {
+    if (cal.to >= 2200 * 12) return;
+    cal.to += 6;
+    renderCal();
+  }
+}
+function onMainScroll() {
+  if (state.tab !== 'cal' || !cal.built || cal.ticking) return;
+  cal.ticking = true;
+  const run = () => {
+    if (!cal.ticking) return;
+    cal.ticking = false;
+    if (state.tab !== 'cal') return;
+    const main = $('#main');
+    if (main.scrollTop < 600) growCal(-1);
+    else if (main.scrollHeight - main.scrollTop - main.clientHeight < 900) growCal(1);
+    updateCalTitle();
+  };
+  requestAnimationFrame(run);
+  setTimeout(run, 150); // 화면 갱신이 멈춘 상태(백그라운드)에서도 처리되도록
+}
+function ensureMonth(idx) { // 그 달이 아직 안 그려졌으면 범위를 넓힘
+  if (!cal.built || (idx >= cal.from && idx <= cal.to)) return;
+  const main = $('#main'), box = $('#months');
+  if (idx < cal.from - 36 || idx > cal.to + 36) { // 너무 멀면 그 달 주변으로 새로 그림
+    if (cal.io) cal.io.disconnect();
+    box.innerHTML = '';
+    cal.els = {}; cal.html = {}; cal.bFrom = 0; cal.bTo = -1;
+    cal.from = idx - 6; cal.to = idx + 12;
+    renderCal();
+  } else if (idx < cal.from) {
+    const h = box.offsetHeight;
+    cal.from = idx - 3;
+    renderCal();
+    main.scrollTop += box.offsetHeight - h;
+  } else {
+    cal.to = idx + 6;
+    renderCal();
+  }
+}
+function scrollMain(top, smooth) { // 화면이 꺼져 있을 땐 부드러운 스크롤이 멈추므로 즉시 이동
+  $('#main').scrollTo({ top: Math.max(0, top), behavior: smooth && !document.hidden ? 'smooth' : 'auto' });
+}
+function gotoMonth(d, smooth) { // 그 달 제목이 맨 위에 오도록
+  ensureMonth(mIdx(d));
+  const el = cal.els[mIdx(d)];
+  if (!el) return;
+  scrollMain(topIn(el) - calTopH() - 6, smooth);
+  updateCalTitle();
+}
+function popCell(d) {
+  const c = $(`#months [data-date="${d}"]`);
+  if (!c) return;
+  c.classList.remove('pop');
+  void c.offsetWidth;
+  c.classList.add('pop');
+}
+function revealDay(d) { // 저장한 날짜가 화면 밖이면 보이는 곳으로 이동
+  if (!isYmd(d) || !cal.built) return;
+  ensureMonth(mIdx(d));
+  const cell = $(`#months [data-date="${d}"]`), main = $('#main');
+  if (!cell) return;
+  const r = cell.getBoundingClientRect(), mr = main.getBoundingClientRect();
+  if (r.top < mr.top + calTopH() || r.bottom > mr.bottom - 90) {
+    scrollMain(topIn(cell) - main.clientHeight / 2, true);
+  }
+  popCell(d);
+}
+function jumpTo(dateStr) {
+  state.sel = dateStr; state.focus = dateStr;
+}
+
+/* ----- 날짜를 눌렀을 때 뜨는 하루 일정 시트 ----- */
+function daySheetHTML(d) {
+  const evs = eventsByDate(d, d)[d] || [];
+  const trips = validTrips().filter(t => t.start <= d && d <= t.end);
+  const h = holidayName(d);
+  const gap = diffDays(todayStr(), d);
+  const when = gap === 0 ? '오늘' : gap === 1 ? '내일' : gap === -1 ? '어제' : gap > 0 ? `${gap}일 뒤` : `${-gap}일 전`;
+  const rows = trips.map(t => `
       <button type="button" class="ev-row trip" data-action="open-trip" data-id="${esc(t.id)}"><i class="bar"></i>
         <span class="ev-main"><span class="ev-title">✈ ${esc(t.title)}</span><span class="ev-sub">${fmtShort(t.start)} – ${fmtShort(t.end)}${t.dest ? ' · ' + esc(t.dest) : ''}</span></span>
         <span class="who trip">여행</span></button>`).join('') +
-    selEvs.map(e => {
+    evs.map(e => {
       const sub = [e.time, isYmd(e.endDate) && e.endDate > e.date ? `${fmtShort(e.date)} – ${fmtShort(e.endDate)}` : '', e.place].filter(Boolean).map(esc).join(' · ');
       return `
       <button type="button" class="ev-row ${ownerCls(e.owner)}" data-action="edit-event" data-id="${esc(e.id)}"><i class="bar"></i>
         <span class="ev-main"><span class="ev-title">${e.type === 'date' ? '<span class="hrt">♥</span> ' : ''}${esc(e.title)}</span>${sub ? `<span class="ev-sub">${sub}</span>` : ''}</span>
         <span class="who ${ownerCls(e.owner)}">${esc(nameOf(e.owner))}</span></button>`;
     }).join('');
-
-  $('#view-cal').innerHTML = `
-    <div class="cal-head">
-      <button type="button" class="cal-title" data-action="today">${state.y}년 ${state.m + 1}월</button>
-      <button type="button" class="btn sm ghost" data-action="today">오늘</button>
-      <button type="button" class="nav-btn" data-action="month" data-d="-1" aria-label="이전 달">${ICON.prev}</button>
-      <button type="button" class="nav-btn" data-action="month" data-d="1" aria-label="다음 달">${ICON.next}</button>
+  return `
+    <div class="dp-head">
+      <div><h3>${fmtMD(d)}</h3><span class="sub">${when}</span>${h ? `<span class="hbadge">${esc(h)}</span>` : ''}</div>
+      <button type="button" class="btn sm" data-action="add-event">+ 일정</button>
     </div>
-    <div class="chips">${fchip('all', '전체', '')}${fchip(me, nameOf(me), 'o-' + me)}${fchip(ot, nameOf(ot), 'o-' + ot)}${fchip('both', '함께', 'o-both')}</div>
-    <div class="dow-row">${DOW.map(d => `<span>${d}</span>`).join('')}</div>
-    <div class="grid ${state.anim.month}" id="cal-grid">${cells}</div>
-    <div class="day-panel ${state.anim.sel || state.anim.month ? 'in' : ''}">
-      <div class="dp-head"><b>${fmtMD(state.sel)}</b><button type="button" class="btn sm ghost" data-action="add-event">+ 일정</button></div>
-      ${rows || '<div class="empty" style="padding:14px 0 6px">등록된 일정이 없어요</div>'}
-    </div>`;
-  state.anim.month = ''; state.anim.sel = false;
+    <div class="day-list">${rows || '<div class="empty"><span class="big">🗓️</span>등록된 일정이 없어요</div>'}</div>`;
 }
-function goMonth(delta) {
-  const d = new Date(state.y, state.m + delta, 1);
-  state.y = d.getFullYear(); state.m = d.getMonth();
-  state.anim.month = delta > 0 ? 'next' : 'prev';
-  const t = todayStr();
-  state.sel = t.slice(0, 7) === ymd(d).slice(0, 7) ? t : ymd(d);
-  renderCal();
-}
-function jumpTo(dateStr) {
-  const d = parseYmd(dateStr);
-  state.y = d.getFullYear(); state.m = d.getMonth(); state.sel = dateStr;
+function openDaySheet(d) { openSheet(daySheetHTML(d), { day: d }); }
+
+/* ----- 데이트 일정을 등록하면 하트가 날아오름 ----- */
+function burstHearts() {
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const box = document.createElement('div');
+  box.className = 'burst';
+  box.style.left = window.innerWidth / 2 + 'px';
+  box.style.top = window.innerHeight * 0.66 + 'px';
+  let html = '';
+  for (let i = 0; i < 18; i++) {
+    const x = Math.round((Math.random() - 0.5) * 300), y = -Math.round(120 + Math.random() * 260);
+    html += `<i style="--x:${x}px;--y:${y}px;--r:${Math.round((Math.random() - 0.5) * 80)}deg;--s:${14 + Math.round(Math.random() * 16)}px;--t:${900 + Math.round(Math.random() * 700)}ms;--dl:${Math.round(Math.random() * 180)}ms;--c:var(--c${i % 2 ? 'a' : 'b'})">♥</i>`;
+  }
+  box.innerHTML = html;
+  document.body.appendChild(box);
+  setTimeout(() => box.remove(), 2000);
 }
 
 /* ----- 일정 등록/수정 시트 ----- */
@@ -1008,19 +1247,21 @@ const actions = {
   'fab': () => { if (state.tab === 'trips') openTripSheet(); else openEventSheet(); },
 
   // 캘린더
-  'month': t => goMonth(Number(t.dataset.d)),
   'today': () => {
-    const t = todayStr(), d = new Date();
-    const same = state.y === d.getFullYear() && state.m === d.getMonth();
-    if (!same) state.anim.month = ymd(new Date(state.y, state.m, 1)) < t ? 'next' : 'prev';
-    jumpTo(t); state.anim.sel = true; renderCal();
+    const t = todayStr();
+    state.sel = t;
+    renderCal();
+    gotoMonth(t, true);
+    popCell(t);
   },
   'filter': t => { state.filter = t.dataset.v; renderCal(); },
   'pick-day': t => {
     const d = t.dataset.date;
-    const mk = `${state.y}-${pad(state.m + 1)}`;
-    if (d.slice(0, 7) !== mk) state.anim.month = d.slice(0, 7) > mk ? 'next' : 'prev';
-    jumpTo(d); state.anim.sel = true; renderCal();
+    if (!isYmd(d)) return;
+    state.sel = d;
+    renderCal();
+    popCell(d);
+    openDaySheet(d);
   },
   'add-event': () => openEventSheet(),
   'edit-event': t => { const e = data.events[t.dataset.id]; if (e) openEventSheet(e); },
@@ -1028,7 +1269,11 @@ const actions = {
 
   // 여행
   'new-trip': () => openTripSheet(),
-  'open-trip': t => openTrip(t.dataset.id),
+  'open-trip': t => {
+    const id = t.dataset.id;
+    if (sheetEl) closeLayers(1); // 하루 일정 시트에서 눌렀으면 시트를 먼저 닫고 연다
+    openTrip(id);
+  },
   'edit-trip': () => { const t = data.trips[state.trip]; if (t) openTripSheet(t); },
   'del-trip': () => {
     if (!sheetCtx || !sheetCtx.doc || !canWrite()) return;
@@ -1109,7 +1354,8 @@ const forms = {
     });
     if (!putDoc('events', doc)) return;
     if (state.filter !== 'all' && !passFilter(doc)) state.filter = 'all';
-    jumpTo(date); state.anim.sel = true;
+    jumpTo(date);
+    if (sheetCtx.isNew && doc.type === 'date') burstHearts();
     closeLayers(1);
   },
   trip: (f, fd) => {
@@ -1209,19 +1455,8 @@ function bindEvents() {
   });
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && layers.length) closeLayers(1); });
 
-  // 달력 좌우 스와이프
-  let sx = 0, sy = 0, tracking = false;
-  const cal = $('#view-cal');
-  cal.addEventListener('touchstart', e => {
-    tracking = !!e.target.closest('#cal-grid') && e.touches.length === 1;
-    if (tracking) { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }
-  }, { passive: true });
-  cal.addEventListener('touchend', e => {
-    if (!tracking) return;
-    tracking = false;
-    const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
-    if (Math.abs(dx) > 56 && Math.abs(dx) > Math.abs(dy) * 1.5) goMonth(dx < 0 ? 1 : -1);
-  }, { passive: true });
+  // 달력 세로 스크롤: 끝에 가까워지면 달을 이어 붙이고, 상단 제목을 현재 달로 갱신
+  $('#main').addEventListener('scroll', onMainScroll, { passive: true });
 
   // 키보드가 올라올 때 시트가 가려지지 않게
   if (window.visualViewport) {
