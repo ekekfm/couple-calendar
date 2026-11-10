@@ -296,15 +296,26 @@ async function connectCloud() {
 
 function parseFbConfig(text) {
   const cfg = {};
-  const re = /["']?(apiKey|authDomain|projectId|storageBucket|messagingSenderId|appId|measurementId|databaseURL)["']?\s*:\s*["']([^"']+)["']/g;
+  // 휴대폰 메모·메신저가 따옴표를 둥근 따옴표(“ ” ‘ ’)로 바꿔도 읽히도록 정리
+  text = String(text || '').replace(/[“”„‟«»＂]/g, '"').replace(/[‘’‚‛`＇]/g, "'");
+  const re =/["']?(apiKey|authDomain|projectId|storageBucket|messagingSenderId|appId|measurementId|databaseURL)["']?\s*:\s*["']([^"']+)["']/g;
   let m;
   while ((m = re.exec(text))) cfg[m[1]] = m[2];
   return cfg.apiKey && cfg.projectId && cfg.appId ? cfg : null;
 }
 const b64enc = s => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-const b64dec = s => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))));
+const b64dec = s => {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return decodeURIComponent(escape(atob(s)));
+};
 function parseInvite(text) {
-  const m = /join=([A-Za-z0-9_-]+)/.exec(text || '');
+  text = String(text || '');
+  try { text = decodeURIComponent(text); } catch (e) { /* 그대로 사용 */ }
+  // 메신저가 긴 링크 중간에 넣은 줄바꿈·공백 제거
+  const at = text.indexOf('join=');
+  if (at < 0) return null;
+  const m = /join=([A-Za-z0-9_-]+)/.exec('join=' + text.slice(at + 5).replace(/\s+/g, ''));
   if (!m) return null;
   try {
     const o = JSON.parse(b64dec(m[1]));
@@ -1142,7 +1153,13 @@ const forms = {
     const inv = parseInvite(text);
     if (inv) { applyInvite(inv); location.reload(); return; }
     const cfg = parseFbConfig(text);
-    if (!cfg) { shake(f.elements.cfg); toast('firebaseConfig 또는 초대 링크를 확인해 주세요'); return; }
+    if (!cfg) {
+      shake(f.elements.cfg);
+      toast(text.indexOf('join=') >= 0 ? '초대 링크가 잘렸어요. 링크 전체를 다시 복사해 주세요'
+        : /apiKey|projectId|appId/.test(text) ? 'apiKey · projectId · appId 줄이 모두 들어가게 복사해 주세요'
+        : 'firebaseConfig 또는 초대 링크를 붙여넣어 주세요');
+      return;
+    }
     settings.fb = cfg; settings.room = randomRoom(); settings.migratedRoom = ''; settings.pendingProfile = null;
     saveSettings();
     location.reload();
