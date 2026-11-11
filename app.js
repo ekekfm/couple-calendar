@@ -412,7 +412,7 @@ function switchTab(tab) {
     state.focus = '';
     renderCal();
     if (changed) {
-      if (cal.scroll == null) gotoMonth(todayStr(), false); else main.scrollTop = cal.scroll;
+      if (cal.scroll == null) { gotoMonth(todayStr(), false); settleToday(); } else main.scrollTop = cal.scroll;
       updateCalTitle();
     }
     if (focus) revealDay(focus);
@@ -521,7 +521,11 @@ const cal = { built: false, from: 0, to: -1, bFrom: 0, bTo: -1, els: {}, html: {
 const mIdx = d => { const p = parseYmd(d); return p.getFullYear() * 12 + p.getMonth(); };
 const idxFirst = i => ymd(new Date(Math.floor(i / 12), i % 12, 1));
 const idxLast = i => ymd(new Date(Math.floor(i / 12), i % 12 + 1, 0));
-const topIn = el => { const main = $('#main'); return el.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop; };
+const topIn = el => {
+  const main = $('#main');
+  if (el.offsetParent === main) return el.offsetTop; // 등장 애니메이션(transform) 중에도 정확
+  return el.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop;
+};
 const calTopH = () => { const t = $('.cal-top'); return t ? t.offsetHeight : 0; };
 
 function monthHTML(idx, map, trips, today) {
@@ -675,8 +679,32 @@ function gotoMonth(d, smooth) { // 그 달 제목이 맨 위에 오도록
   ensureMonth(mIdx(d));
   const el = cal.els[mIdx(d)];
   if (!el) return;
-  scrollMain(topIn(el) - calTopH() - 6, smooth);
+  const main = $('#main'), head = calTopH();
+  let top = topIn(el) - head - 6;
+  const cell = $(`#months [data-date="${d}"]`);
+  if (cell) { // 월말처럼 그 날짜가 화면 아래로 잘리면, 날짜가 가운데 오도록
+    const cellTop = topIn(cell);
+    if (cellTop + cell.offsetHeight - top > main.clientHeight - 70) top = cellTop - head - (main.clientHeight - head - cell.offsetHeight) / 2;
+  }
+  scrollMain(top, smooth);
   updateCalTitle();
+}
+function goToday(smooth) { // 달력을 오늘 위치로
+  const t = todayStr();
+  state.sel = t;
+  renderCal();
+  gotoMonth(t, smooth);
+}
+// 앱을 열 때: 일부 기기(iOS)는 화면이 그려지기 전의 스크롤 지정을 무시하므로, 손대기 전까지 몇 번 다시 맞춘다
+let userMoved = false;
+function settleToday() {
+  userMoved = false;
+  [0, 60, 250, 700, 1500].forEach(ms => setTimeout(() => {
+    if (userMoved || state.tab !== 'cal' || layers.length) return;
+    const t = todayStr();
+    if (state.sel !== t) { state.sel = t; renderCal(); }
+    gotoMonth(t, false);
+  }, ms));
 }
 function popCell(d) {
   const c = $(`#months [data-date="${d}"]`);
@@ -1248,11 +1276,9 @@ const actions = {
 
   // 캘린더
   'today': () => {
-    const t = todayStr();
-    state.sel = t;
-    renderCal();
-    gotoMonth(t, true);
-    popCell(t);
+    userMoved = true;
+    goToday(true);
+    popCell(todayStr());
   },
   'filter': t => { state.filter = t.dataset.v; renderCal(); },
   'pick-day': t => {
@@ -1457,6 +1483,7 @@ function bindEvents() {
 
   // 달력 세로 스크롤: 끝에 가까워지면 달을 이어 붙이고, 상단 제목을 현재 달로 갱신
   $('#main').addEventListener('scroll', onMainScroll, { passive: true });
+  ['touchstart', 'wheel', 'pointerdown', 'keydown'].forEach(ev => document.addEventListener(ev, () => { userMoved = true; }, { passive: true, capture: true }));
 
   // 키보드가 올라올 때 시트가 가려지지 않게
   if (window.visualViewport) {
@@ -1476,7 +1503,15 @@ function bindEvents() {
   });
   window.addEventListener('online', () => { if (cloud.on && !cloud.ready) connectCloud(); });
   window.addEventListener('offline', () => { if (cloud.ready && cloud.status === 'on') setStatus('offline'); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleRender(); });
+  // 다른 앱에 갔다가 돌아오면(10초 이상) 달력을 다시 오늘로
+  let hiddenAt = 0;
+  const onReturn = () => {
+    scheduleRender();
+    if (hiddenAt && Date.now() - hiddenAt > 10000 && state.tab === 'cal' && !layers.length) settleToday();
+    hiddenAt = 0;
+  };
+  document.addEventListener('visibilitychange', () => { if (document.hidden) hiddenAt = Date.now(); else onReturn(); });
+  window.addEventListener('pageshow', e => { if (e.persisted) { hiddenAt = hiddenAt || 1; onReturn(); } });
   window.addEventListener('beforeinstallprompt', e => {
     e.preventDefault();
     installEvt = e;
