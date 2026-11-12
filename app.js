@@ -32,6 +32,7 @@ const ICON = {
   prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
   next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.500 4.500L19 7.500"/></svg>',
+  camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5A2.500 2.500 0 0 1 6.500 6h1.300l1.400-2h5.600l1.400 2h1.300A2.500 2.500 0 0 1 20 8.500V17a2.500 2.500 0 0 1-2.500 2.500h-11A2.500 2.500 0 0 1 4 17z"/><circle cx="12" cy="12.500" r="3.500"/></svg>',
 };
 
 /* =====================================================================
@@ -132,7 +133,7 @@ let sheetEl = null, sheetCtx = null;
 function openSheet(html, ctx) {
   whenIdle(() => {
     sheetCtx = ctx || null;
-    if (sheetEl) { $('.sheet-body', sheetEl).innerHTML = html; return; }
+    if (sheetEl) { $('.sheet-body', sheetEl).innerHTML = html; if (ctx && ctx.onOpen) ctx.onOpen(); return; }
     const el = document.createElement('div');
     el.className = 'sheet-wrap';
     el.innerHTML = `<div class="backdrop" data-action="close-layer"></div><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div><div class="sheet-body">${html}</div></div>`;
@@ -141,6 +142,7 @@ function openSheet(html, ctx) {
     pushLayer(closeSheetNow);
     const af = el.querySelector('[data-autofocus]');
     if (af) af.focus();
+    if (ctx && ctx.onOpen) ctx.onOpen();
   });
 }
 function closeSheetNow() {
@@ -187,6 +189,67 @@ function delDoc(col, id) {
   scheduleRender();
   return true;
 }
+/* ----- 사진 저장소 -----
+   사진은 일정 문서와 따로 'photos'에 저장하고, 일정을 열 때만 불러온다(실시간 구독 X → 무료 한도 절약).
+   이 기기 사본은 IndexedDB(localStorage는 5MB 한계라 사진에 부적합). */
+const PHOTO_MAX = 3;
+const PHOTO_BUDGET = 700000; // dataURL 글자 수. Firestore 문서 1MB 제한 안쪽으로
+const safeImg = s => (typeof s === 'string' && s.length < 1000000 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(s) ? s : '');
+const photosOf = e => (e && Array.isArray(e.photos)
+  ? e.photos.filter(p => p && typeof p.id === 'string' && /^[a-z0-9]{6,40}$/.test(p.id)).slice(0, PHOTO_MAX) : []);
+let idbP = null;
+function idbOpen() {
+  if (!idbP) {
+    idbP = new Promise((res, rej) => {
+      if (!window.indexedDB) { rej(new Error('no-idb')); return; }
+      const r = indexedDB.open('cc-photos', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('p');
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+      r.onblocked = () => rej(new Error('blocked'));
+    });
+    idbP.catch(() => { idbP = null; });
+  }
+  return idbP;
+}
+function idbDo(mode, fn) {
+  return idbOpen().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('p', mode);
+    const req = fn(tx.objectStore('p'));
+    tx.oncomplete = () => res(req && req.result);
+    tx.onerror = () => rej(tx.error);
+    tx.onabort = () => rej(tx.error);
+  }));
+}
+const idbGet = id => idbDo('readonly', s => s.get(id)).catch(() => undefined);
+const idbPut = (id, v) => idbDo('readwrite', s => s.put(v, id));
+const idbDel = id => idbDo('readwrite', s => s.delete(id)).catch(() => {});
+
+const photoMem = {};
+async function loadPhoto(id) {
+  if (photoMem[id]) return photoMem[id];
+  let rec = await idbGet(id);
+  if (!(rec && safeImg(rec.data)) && cloud.ready) {
+    try {
+      const snap = await cloud.fs.getDoc(docRef('photos', id));
+      if (snap.exists()) { rec = snap.data(); idbPut(id, rec).catch(() => {}); }
+    } catch (e) { /* 오프라인 등: 아래에서 빈 값 */ }
+  }
+  const d = rec && safeImg(rec.data);
+  if (d) photoMem[id] = d;
+  return d || '';
+}
+function savePhoto(rec) {
+  photoMem[rec.id] = rec.data;
+  if (cloud.ready) cloud.fs.setDoc(docRef('photos', rec.id), rec).catch(onWriteErr);
+  return idbPut(rec.id, rec);
+}
+function removePhoto(id) {
+  delete photoMem[id];
+  idbDel(id);
+  if (cloud.ready) cloud.fs.deleteDoc(docRef('photos', id)).catch(onWriteErr);
+}
+
 function mergePatch(a, b) {
   const out = Object.assign({}, a || {});
   if (b.names) out.names = Object.assign({}, out.names, b.names);
@@ -253,6 +316,10 @@ async function connectCloud() {
         docs.slice(i, i + 400).forEach(([col, d]) => batch.set(docRef(col, d.id), d));
         jobs.push(batch.commit());
       }
+      // 이 기기에만 있던 사진도 함께 올림
+      Object.values(data.events).forEach(e => photosOf(e).forEach(p => {
+        jobs.push(idbGet(p.id).then(rec => (rec && safeImg(rec.data) ? fs.setDoc(docRef('photos', p.id), rec) : null)));
+      }));
       if (settings.onboarded) {
         const p = data.profile, me = settings.me;
         const patch = { names: { [me]: p.names[me] }, colors: { [me]: p.colors[me] } };
@@ -740,7 +807,8 @@ function daySheetHTML(d) {
         <span class="ev-main"><span class="ev-title">✈ ${esc(t.title)}</span><span class="ev-sub">${fmtShort(t.start)} – ${fmtShort(t.end)}${t.dest ? ' · ' + esc(t.dest) : ''}</span></span>
         <span class="who trip">여행</span></button>`).join('') +
     evs.map(e => {
-      const sub = [e.time, isYmd(e.endDate) && e.endDate > e.date ? `${fmtShort(e.date)} – ${fmtShort(e.endDate)}` : '', e.place].filter(Boolean).map(esc).join(' · ');
+      const np = photosOf(e).length;
+      const sub = [e.time, isYmd(e.endDate) && e.endDate > e.date ? `${fmtShort(e.date)} – ${fmtShort(e.endDate)}` : '', e.place, np ? `📷 ${np}` : ''].filter(Boolean).map(esc).join(' · ');
       return `
       <button type="button" class="ev-row ${ownerCls(e.owner)}" data-action="edit-event" data-id="${esc(e.id)}"><i class="bar"></i>
         <span class="ev-main"><span class="ev-title">${e.type === 'date' ? '<span class="hrt">♥</span> ' : ''}${esc(e.title)}</span>${sub ? `<span class="ev-sub">${sub}</span>` : ''}</span>
@@ -794,6 +862,9 @@ function openEventSheet(existing, preset) {
         <label class="field"><span>날짜</span><input type="date" name="date" value="${esc(e.date)}"></label>
         <label class="field"><span>시간 (선택)</span><input type="time" name="time" value="${esc(e.time)}"></label>
       </div>
+      <div class="field"><span>사진 (최대 ${PHOTO_MAX}장)</span><div class="ph-row" id="ph-row"></div></div>
+      <input type="file" accept="image/*" id="ph-input" hidden>
+      <div class="ph-edit" id="ph-edit" hidden></div>
       <details class="more" ${hasMore ? 'open' : ''}>
         <summary>종료일 · 장소 · 메모</summary>
         <div class="stack">
@@ -806,7 +877,205 @@ function openEventSheet(existing, preset) {
         ${isNew ? '' : '<button type="button" class="btn danger" data-action="del-event" data-confirm>삭제</button>'}
         <button type="submit" class="btn">${isNew ? '등록' : '저장'}</button>
       </div>
-    </form>`, { doc: e, isNew });
+    </form>`, {
+    doc: e, isNew,
+    photos: photosOf(e).map(p => ({ id: p.id, cut: !!p.cut, data: photoMem[p.id] || null })),
+    removed: [], edit: null,
+    onOpen() { renderPhotoRow(); loadSheetPhotos(this); },
+  });
+}
+
+/* ----- 일정 시트 안의 사진 ----- */
+function loadSheetPhotos(ctx) {
+  ctx.photos.filter(p => p.data == null).forEach(p => {
+    loadPhoto(p.id).then(d => {
+      p.data = d; // ''면 불러오지 못한 사진
+      if (sheetCtx === ctx) renderPhotoRow();
+    });
+  });
+}
+function renderPhotoRow() {
+  const row = $('#ph-row');
+  if (!row || !sheetCtx || !sheetCtx.photos) return;
+  const ps = sheetCtx.photos;
+  row.innerHTML = ps.map((p, i) => `
+    <div class="ph-thumb${p.cut ? ' cut' : ''}">
+      ${p.data ? `<img src="${p.data}" alt="">` : p.data === '' ? '<span class="ph-miss">불러올 수 없음</span>' : '<i class="ph-load"></i>'}
+      ${p.data ? `<button type="button" class="ph-open" data-action="ph-view" data-i="${i}" aria-label="사진 크게 보기"></button>` : ''}
+      <button type="button" class="ph-x" data-action="ph-del" data-i="${i}" aria-label="사진 빼기">✕</button>
+    </div>`).join('') +
+    (ps.length < PHOTO_MAX && !sheetCtx.edit ? `<button type="button" class="ph-add" data-action="ph-add">${ICON.camera}<span>추가</span></button>` : '');
+}
+function renderPhotoEdit() {
+  const box = $('#ph-edit');
+  if (!box || !sheetCtx) return;
+  const ed = sheetCtx.edit;
+  box.hidden = !ed;
+  if (!ed) { box.innerHTML = ''; return; }
+  const cutMode = ed.mode === 'cut';
+  const src = cutMode ? ed.cut : ed.orig;
+  box.innerHTML = `
+    <div class="ph-stage${cutMode ? ' checker' : ''}">
+      ${src ? `<img src="${src}" alt="미리보기">` : ''}
+      ${ed.busy ? `<div class="ph-busy"><i class="spin"></i><span>${ed.busyMsg}</span></div>` : ''}
+    </div>
+    <div class="ph-btns">
+      <button type="button" class="btn sm ghost" data-action="ph-cancel"${ed.busy ? ' disabled' : ''}>취소</button>
+      ${cutMode
+        ? `<button type="button" class="btn sm ghost" data-action="ph-orig"${ed.busy ? ' disabled' : ''}>원본으로</button>`
+        : `<button type="button" class="btn sm ghost" data-action="ph-cut"${ed.busy || !ed.orig ? ' disabled' : ''}>✂ 인물만 남기기</button>`}
+      <button type="button" class="btn sm" data-action="ph-ok"${ed.busy || !src ? ' disabled' : ''}>이 사진 추가</button>
+    </div>`;
+  if (!box.dataset.shown) { box.dataset.shown = '1'; box.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+}
+async function onPhotoPicked(input) {
+  const ctx = sheetCtx, file = input.files && input.files[0];
+  input.value = ''; // 같은 사진을 다시 골라도 반응하도록
+  if (!ctx || !ctx.photos || !file) return;
+  if (!/^image\//.test(file.type || 'image/')) { toast('사진 파일만 넣을 수 있어요'); return; }
+  ctx.edit = { img: null, orig: '', cut: '', mode: 'orig', busy: true, busyMsg: '사진 준비 중…' };
+  const box = $('#ph-edit'); if (box) delete box.dataset.shown;
+  renderPhotoRow(); renderPhotoEdit();
+  try {
+    const img = await loadImageFile(file);
+    const orig = encodeFit(toCanvas(img, 1280), false);
+    if (sheetCtx !== ctx || !ctx.edit) return;
+    if (!orig) throw new Error('encode');
+    Object.assign(ctx.edit, { img, orig, busy: false });
+  } catch (e) {
+    if (sheetCtx !== ctx) return;
+    ctx.edit = null;
+    toast('이 사진은 열 수 없어요. 다른 사진을 골라 주세요');
+  }
+  renderPhotoRow(); renderPhotoEdit();
+}
+async function runCutout() {
+  const ctx = sheetCtx, ed = ctx && ctx.edit;
+  if (!ed || ed.busy || !ed.img) return;
+  if (ed.cut) { ed.mode = 'cut'; renderPhotoEdit(); return; }
+  ed.busy = true;
+  ed.busyMsg = segReady ? '인물을 찾는 중…' : '누끼 모델 내려받는 중… 처음 한 번만 조금 걸려요';
+  renderPhotoEdit();
+  await new Promise(r => setTimeout(r, 60)); // 안내 문구가 먼저 그려지도록
+  try {
+    const cut = await cutoutPerson(ed.img);
+    if (sheetCtx !== ctx || ctx.edit !== ed) return;
+    ed.busy = false;
+    if (!cut) { toast('사진에서 사람을 찾지 못했어요'); renderPhotoEdit(); return; }
+    ed.cut = cut; ed.mode = 'cut';
+  } catch (e) {
+    if (sheetCtx !== ctx || ctx.edit !== ed) return;
+    ed.busy = false;
+    toast(navigator.onLine === false ? '처음 누끼는 인터넷 연결이 필요해요' : '누끼를 만들지 못했어요. 잠시 후 다시 시도해 주세요');
+  }
+  renderPhotoEdit();
+}
+function openViewer(src, cut) {
+  if (!src) return;
+  whenIdle(() => {
+    const el = document.createElement('div');
+    el.className = 'viewer' + (cut ? ' cut' : '');
+    el.dataset.action = 'close-layer';
+    el.innerHTML = `<img src="${src}" alt=""><span class="viewer-x" aria-hidden="true">✕</span>`;
+    document.body.appendChild(el);
+    pushLayer(() => { el.classList.add('closing'); setTimeout(() => el.remove(), 230); });
+  });
+}
+
+/* ----- 사진 줄이기 / 누끼 ----- */
+function loadImageFile(file) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { res(img); setTimeout(() => URL.revokeObjectURL(url), 0); };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('decode')); };
+    img.src = url; // 브라우저가 사진의 회전 정보(EXIF)를 반영해 그려 줌
+  });
+}
+function toCanvas(src, maxSide) {
+  const w0 = src.naturalWidth || src.width, h0 = src.naturalHeight || src.height;
+  const k = Math.min(1, maxSide / Math.max(w0, h0));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w0 * k)); c.height = Math.max(1, Math.round(h0 * k));
+  const g = c.getContext('2d');
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(src, 0, 0, c.width, c.height);
+  return c;
+}
+function encodeFit(canvas, alpha) { // 용량 한도 안에 들어올 때까지 줄여서 저장
+  let c = canvas;
+  for (let i = 0; i < 9; i++) {
+    let url = '';
+    if (alpha) {
+      url = c.toDataURL('image/webp', 0.85); // 투명 배경 유지. 아이폰은 webp를 못 만들어 png로 대체
+      if (url.indexOf('data:image/webp') !== 0) url = c.toDataURL('image/png');
+    } else {
+      url = c.toDataURL('image/jpeg', i < 2 ? 0.82 : 0.72);
+    }
+    if (url.length <= PHOTO_BUDGET) return url;
+    c = toCanvas(c, Math.round(Math.max(c.width, c.height) * 0.8));
+  }
+  return '';
+}
+const MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MP_MODEL = 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite';
+let segP = null, segReady = false;
+function getSegmenter() {
+  if (!segP) {
+    segP = (async () => {
+      const mp = await import(MP_BASE + '/vision_bundle.mjs');
+      const files = await mp.FilesetResolver.forVisionTasks(MP_BASE + '/wasm');
+      const make = delegate => mp.ImageSegmenter.createFromOptions(files, {
+        baseOptions: { modelAssetPath: MP_MODEL, delegate },
+        runningMode: 'IMAGE', outputCategoryMask: false, outputConfidenceMasks: true,
+      });
+      let seg;
+      try { seg = await make('GPU'); } catch (e) { seg = await make('CPU'); }
+      segReady = true;
+      return seg;
+    })();
+    segP.catch(() => { segP = null; });
+  }
+  return segP;
+}
+async function cutoutPerson(img) {
+  const seg = await getSegmenter();
+  const c = toCanvas(img, 1024);
+  let bg = null, mw = 0, mh = 0;
+  seg.segment(c, r => { // 콜백 안에서 복사해야 메모리가 자동 정리됨
+    const m = r.confidenceMasks && r.confidenceMasks[0]; // 0번 = 배경일 확률
+    if (m) { mw = m.width; mh = m.height; bg = m.getAsFloat32Array().slice(); }
+  });
+  if (!bg || !mw || !mh) throw new Error('mask');
+  const a = document.createElement('canvas');
+  a.width = mw; a.height = mh;
+  const ag = a.getContext('2d');
+  const id = ag.createImageData(mw, mh);
+  let fg = 0, x0 = mw, y0 = mh, x1 = -1, y1 = -1;
+  for (let y = 0; y < mh; y++) {
+    for (let x = 0; x < mw; x++) {
+      const i = y * mw + x;
+      const v = Math.max(0, Math.min(1, (0.8 - bg[i]) / 0.6)); // 경계를 부드럽게
+      if (v > 0.05) { fg++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      id.data[i * 4 + 3] = Math.round(v * 255);
+    }
+  }
+  if (fg < mw * mh * 0.01) return '';
+  ag.putImageData(id, 0, 0);
+  const o = document.createElement('canvas');
+  o.width = c.width; o.height = c.height;
+  const og = o.getContext('2d');
+  og.drawImage(c, 0, 0);
+  og.globalCompositeOperation = 'destination-in';
+  og.drawImage(a, 0, 0, c.width, c.height);
+  // 사람 주변만 잘라서 용량 절약
+  const sx = c.width / mw, sy = c.height / mh, pad = Math.round(Math.max(c.width, c.height) * 0.03);
+  const cx0 = Math.max(0, Math.floor(x0 * sx) - pad), cy0 = Math.max(0, Math.floor(y0 * sy) - pad);
+  const cx1 = Math.min(c.width, Math.ceil((x1 + 1) * sx) + pad), cy1 = Math.min(c.height, Math.ceil((y1 + 1) * sy) + pad);
+  const k = document.createElement('canvas');
+  k.width = cx1 - cx0; k.height = cy1 - cy0;
+  k.getContext('2d').drawImage(o, cx0, cy0, k.width, k.height, 0, 0, k.width, k.height);
+  return encodeFit(toCanvas(k, 900), true);
 }
 
 /* =====================================================================
@@ -1291,7 +1560,39 @@ const actions = {
   },
   'add-event': () => openEventSheet(),
   'edit-event': t => { const e = data.events[t.dataset.id]; if (e) openEventSheet(e); },
-  'del-event': () => { if (sheetCtx && sheetCtx.doc && delDoc('events', sheetCtx.doc.id)) closeLayers(1); },
+  'del-event': () => {
+    if (!sheetCtx || !sheetCtx.doc || !canWrite()) return;
+    const id = sheetCtx.doc.id;
+    const cur = data.events[id] || sheetCtx.doc;
+    if (!delDoc('events', id)) return;
+    photosOf(cur).forEach(p => removePhoto(p.id)); // 일정과 함께 사진도 삭제
+    closeLayers(1);
+  },
+
+  // 일정 사진
+  'ph-add': () => { const i = $('#ph-input'); if (i && sheetCtx && sheetCtx.photos && sheetCtx.photos.length < PHOTO_MAX) i.click(); },
+  'ph-del': t => {
+    const ps = sheetCtx && sheetCtx.photos;
+    const p = ps && ps[Number(t.dataset.i)];
+    if (!p) return;
+    ps.splice(ps.indexOf(p), 1);
+    if (!p.isNew) sheetCtx.removed.push(p.id); // 실제 삭제는 '저장'을 눌렀을 때
+    renderPhotoRow();
+  },
+  'ph-view': t => { const p = sheetCtx && sheetCtx.photos && sheetCtx.photos[Number(t.dataset.i)]; if (p) openViewer(p.data, p.cut); },
+  'ph-cancel': () => { if (sheetCtx && sheetCtx.edit && !sheetCtx.edit.busy) { sheetCtx.edit = null; renderPhotoEdit(); renderPhotoRow(); } },
+  'ph-cut': () => runCutout(),
+  'ph-orig': () => { const ed = sheetCtx && sheetCtx.edit; if (ed && !ed.busy) { ed.mode = 'orig'; renderPhotoEdit(); } },
+  'ph-ok': () => {
+    const ed = sheetCtx && sheetCtx.edit;
+    if (!ed || ed.busy || sheetCtx.photos.length >= PHOTO_MAX) return;
+    const cut = ed.mode === 'cut' && !!ed.cut;
+    const d = cut ? ed.cut : ed.orig;
+    if (!d) return;
+    sheetCtx.photos.push({ id: uid(), cut, data: d, isNew: true });
+    sheetCtx.edit = null;
+    renderPhotoEdit(); renderPhotoRow();
+  },
 
   // 여행
   'new-trip': () => openTripSheet(),
@@ -1378,7 +1679,20 @@ const forms = {
       place: String(fd.get('place') || '').trim(),
       memo: String(fd.get('memo') || '').trim(),
     });
+    if (sheetCtx.photos) {
+      if (sheetCtx.edit && !sheetCtx.edit.busy && (sheetCtx.edit.orig || sheetCtx.edit.cut)) {
+        toast('미리보기 중인 사진은 "이 사진 추가"를 눌러야 들어가요'); return;
+      }
+      if (!canWrite()) return;
+      sheetCtx.photos.filter(p => p.isNew && p.data).forEach(p => {
+        p.isNew = false;
+        savePhoto({ id: p.id, eventId: doc.id, data: p.data, cut: p.cut, by: settings.me, createdAt: Date.now() })
+          .catch(() => { if (!cloud.on) toast('이 기기에 사진을 저장하지 못했어요 (저장 공간 확인)'); });
+      });
+      doc.photos = sheetCtx.photos.map(p => ({ id: p.id, cut: !!p.cut }));
+    }
     if (!putDoc('events', doc)) return;
+    (sheetCtx.removed || []).forEach(removePhoto);
     if (state.filter !== 'all' && !passFilter(doc)) state.filter = 'all';
     jumpTo(date);
     if (sheetCtx.isNew && doc.type === 'date') burstHearts();
@@ -1471,6 +1785,7 @@ function bindEvents() {
   document.addEventListener('change', e => {
     const t = e.target;
     if (!t || !t.dataset) return;
+    if (t.id === 'ph-input') { onPhotoPicked(t); return; }
     if (t.dataset.change === 'name') setProfile({ names: { [t.dataset.k]: t.value.trim().slice(0, 12) } });
     else if (t.dataset.change === 'since') setProfile({ since: isYmd(t.value) ? t.value : '' });
     else if (t.dataset.change === 'me') { settings.me = t.value === 'b' ? 'b' : 'a'; saveSettings(); renderHeader(); renderSettings(); }
