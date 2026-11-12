@@ -2,7 +2,7 @@
    - 앱 파일: 네트워크 우선(항상 최신) → 실패/지연 시 캐시 (오프라인 실행)
    - Firebase SDK(버전 고정 URL): 캐시 우선
    - 그 외 외부 요청(지도·날씨·Firestore 통신)은 건드리지 않음 */
-const CACHE = 'couple-cal-v3';
+const CACHE = 'couple-cal-v4';
 const KEEP = ['couple-cal-ext-v1']; // 외부 라이브러리 캐시는 앱을 업데이트해도 유지
 const SHELL = [
   './', './index.html', './styles.css', './app.js', './manifest.webmanifest',

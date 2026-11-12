@@ -197,6 +197,12 @@ const PHOTO_BUDGET = 700000; // dataURL 글자 수. Firestore 문서 1MB 제한 
 const safeImg = s => (typeof s === 'string' && s.length < 1000000 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(s) ? s : '');
 const photosOf = e => (e && Array.isArray(e.photos)
   ? e.photos.filter(p => p && typeof p.id === 'string' && /^[a-z0-9]{6,40}$/.test(p.id)).slice(0, PHOTO_MAX) : []);
+// 달력에 띄울 아주 작은 미리보기(일정 문서 안에 같이 저장, 몇 KB)
+const thumbOf = p => (p && typeof p.t === 'string' && p.t.length < 24000 ? safeImg(p.t) : '');
+const firstThumb = evs => {
+  for (const e of evs) for (const p of photosOf(e)) { const t = thumbOf(p); if (t) return { t, cut: !!p.cut }; }
+  return null;
+};
 let idbP = null;
 function idbOpen() {
   if (!idbP) {
@@ -614,9 +620,11 @@ function monthHTML(idx, map, trips, today) {
     const shown = evs.length > room ? evs.slice(0, room - 1) : evs;
     const pills = shown.map(e => `<span class="pill ${ownerCls(e.owner)}">${e.type === 'date' ? '♥' : ''}${esc(e.title)}</span>`).join('');
     const more = evs.length > shown.length ? `<span class="more">+${evs.length - shown.length}</span>` : '';
+    const ph = firstThumb(evs);
+    const phImg = ph ? `<img class="cph${ph.cut ? ' cut' : ''}" src="${ph.t}" alt="">` : '';
     const band = cover.length
       ? `<i class="tripband${cover.some(t => t.start === d) ? ' s' : ''}${cover.some(t => t.end === d) ? ' e' : ''}"></i>` : '';
-    cells += `<button type="button" class="${cls.join(' ')}" data-action="pick-day" data-date="${d}" aria-label="${fmtMD(d)}${h ? ' ' + esc(h) : ''} 일정 ${evs.length}개"><span class="num">${n}</span>${h ? `<span class="hname">${esc(h)}</span>` : ''}${pills}${more}${band}</button>`;
+    cells += `<button type="button" class="${cls.join(' ')}" data-action="pick-day" data-date="${d}" aria-label="${fmtMD(d)}${h ? ' ' + esc(h) : ''} 일정 ${evs.length}개"><span class="num">${n}</span>${phImg}${h ? `<span class="hname">${esc(h)}</span>` : ''}${pills}${more}${band}</button>`;
   }
   return `<h3 class="m-title"><b>${m + 1}</b>월<small>${y}</small></h3><div class="grid">${cells}</div>`;
 }
@@ -807,11 +815,12 @@ function daySheetHTML(d) {
         <span class="ev-main"><span class="ev-title">✈ ${esc(t.title)}</span><span class="ev-sub">${fmtShort(t.start)} – ${fmtShort(t.end)}${t.dest ? ' · ' + esc(t.dest) : ''}</span></span>
         <span class="who trip">여행</span></button>`).join('') +
     evs.map(e => {
-      const np = photosOf(e).length;
+      const np = photosOf(e).length, ph = firstThumb([e]);
       const sub = [e.time, isYmd(e.endDate) && e.endDate > e.date ? `${fmtShort(e.date)} – ${fmtShort(e.endDate)}` : '', e.place, np ? `📷 ${np}` : ''].filter(Boolean).map(esc).join(' · ');
       return `
       <button type="button" class="ev-row ${ownerCls(e.owner)}" data-action="edit-event" data-id="${esc(e.id)}"><i class="bar"></i>
         <span class="ev-main"><span class="ev-title">${e.type === 'date' ? '<span class="hrt">♥</span> ' : ''}${esc(e.title)}</span>${sub ? `<span class="ev-sub">${sub}</span>` : ''}</span>
+        ${ph ? `<img class="ev-ph${ph.cut ? ' cut' : ''}" src="${ph.t}" alt="">` : ''}
         <span class="who ${ownerCls(e.owner)}">${esc(nameOf(e.owner))}</span></button>`;
     }).join('');
   return `
@@ -862,9 +871,16 @@ function openEventSheet(existing, preset) {
         <label class="field"><span>날짜</span><input type="date" name="date" value="${esc(e.date)}"></label>
         <label class="field"><span>시간 (선택)</span><input type="time" name="time" value="${esc(e.time)}"></label>
       </div>
-      <div class="field"><span>사진 (최대 ${PHOTO_MAX}장)</span><div class="ph-row" id="ph-row"></div></div>
-      <input type="file" accept="image/*" id="ph-input" hidden>
-      <div class="ph-edit" id="ph-edit" hidden></div>
+      <section class="ph-box">
+        <div class="ph-h"><b>사진</b><small id="ph-count"></small></div>
+        <div class="ph-gal" id="ph-row"></div>
+      </section>
+      <section class="ph-box add">
+        <div class="ph-h"><b>사진 추가</b><small>고른 뒤 ✂로 스티커처럼 만들 수 있어요</small></div>
+        <button type="button" class="ph-pick" id="ph-pick" data-action="ph-add"></button>
+        <input type="file" accept="image/*" id="ph-input" hidden>
+        <div class="ph-edit" id="ph-edit" hidden></div>
+      </section>
       <details class="more" ${hasMore ? 'open' : ''}>
         <summary>종료일 · 장소 · 메모</summary>
         <div class="stack">
@@ -879,17 +895,23 @@ function openEventSheet(existing, preset) {
       </div>
     </form>`, {
     doc: e, isNew,
-    photos: photosOf(e).map(p => ({ id: p.id, cut: !!p.cut, data: photoMem[p.id] || null })),
+    photos: photosOf(e).map(p => ({ id: p.id, cut: !!p.cut, t: thumbOf(p), data: photoMem[p.id] || null })),
     removed: [], edit: null,
     onOpen() { renderPhotoRow(); loadSheetPhotos(this); },
   });
 }
 
 /* ----- 일정 시트 안의 사진 ----- */
+function needThumb(p) { // 작은 미리보기가 없는 사진(예전 사진 포함)은 만들어 둠 → 저장할 때 같이 기록
+  if (p.t || p.tp || !p.data) return;
+  p.tp = makeThumb(p.data, p.cut).then(t => { p.t = t; p.tp = null; });
+}
 function loadSheetPhotos(ctx) {
+  ctx.photos.forEach(needThumb);
   ctx.photos.filter(p => p.data == null).forEach(p => {
     loadPhoto(p.id).then(d => {
       p.data = d; // ''면 불러오지 못한 사진
+      needThumb(p);
       if (sheetCtx === ctx) renderPhotoRow();
     });
   });
@@ -897,14 +919,44 @@ function loadSheetPhotos(ctx) {
 function renderPhotoRow() {
   const row = $('#ph-row');
   if (!row || !sheetCtx || !sheetCtx.photos) return;
-  const ps = sheetCtx.photos;
-  row.innerHTML = ps.map((p, i) => `
-    <div class="ph-thumb${p.cut ? ' cut' : ''}">
+  const ps = sheetCtx.photos, ed = sheetCtx.edit;
+  const cnt = $('#ph-count'); if (cnt) cnt.textContent = `${ps.length} / ${PHOTO_MAX}`;
+  row.innerHTML = ps.length ? ps.map((p, i) => `
+    <div class="ph-card${p.cut ? ' cut' : ''}" style="--r:${[-3, 2, -1.5][i % 3]}deg">
       ${p.data ? `<img src="${p.data}" alt="">` : p.data === '' ? '<span class="ph-miss">불러올 수 없음</span>' : '<i class="ph-load"></i>'}
       ${p.data ? `<button type="button" class="ph-open" data-action="ph-view" data-i="${i}" aria-label="사진 크게 보기"></button>` : ''}
       <button type="button" class="ph-x" data-action="ph-del" data-i="${i}" aria-label="사진 빼기">✕</button>
-    </div>`).join('') +
-    (ps.length < PHOTO_MAX && !sheetCtx.edit ? `<button type="button" class="ph-add" data-action="ph-add">${ICON.camera}<span>추가</span></button>` : '');
+    </div>`).join('')
+    : '<p class="ph-empty">아직 사진이 없어요. 아래에서 추가해 보세요</p>';
+  const pick = $('#ph-pick');
+  if (pick) {
+    const full = ps.length >= PHOTO_MAX;
+    pick.hidden = !!ed;
+    pick.disabled = full;
+    pick.innerHTML = full ? `최대 ${PHOTO_MAX}장까지 넣었어요` : `${ICON.camera}<span>앨범에서 사진 고르기</span>`;
+  }
+}
+function makeThumb(src, cut) { // 달력용: 원본은 정사각형으로 잘라 64px, 누끼는 모양 그대로 64px
+  return new Promise(res => {
+    const im = new Image();
+    im.onload = () => {
+      try {
+        let c = toCanvas(im, 256); // 한 번에 크게 줄이면 거칠어서 두 단계로
+        if (!cut) {
+          const s = Math.min(c.width, c.height), q = document.createElement('canvas');
+          q.width = q.height = s;
+          q.getContext('2d').drawImage(c, (c.width - s) / 2, (c.height - s) / 2, s, s, 0, 0, s, s);
+          c = q;
+        }
+        c = toCanvas(c, 64);
+        let url = cut ? c.toDataURL('image/webp', 0.8) : c.toDataURL('image/jpeg', 0.75);
+        if (cut && url.indexOf('data:image/webp') !== 0) url = c.toDataURL('image/png');
+        res(safeImg(url) && url.length < 24000 ? url : '');
+      } catch (e) { res(''); }
+    };
+    im.onerror = () => res('');
+    im.src = src;
+  });
 }
 function renderPhotoEdit() {
   const box = $('#ph-edit');
@@ -915,7 +967,7 @@ function renderPhotoEdit() {
   const cutMode = ed.mode === 'cut';
   const src = cutMode ? ed.cut : ed.orig;
   box.innerHTML = `
-    <div class="ph-stage${cutMode ? ' checker' : ''}">
+    <div class="ph-stage${cutMode ? ' sticker' : ''}">
       ${src ? `<img src="${src}" alt="미리보기">` : ''}
       ${ed.busy ? `<div class="ph-busy"><i class="spin"></i><span>${ed.busyMsg}</span></div>` : ''}
     </div>
@@ -923,7 +975,7 @@ function renderPhotoEdit() {
       <button type="button" class="btn sm ghost" data-action="ph-cancel"${ed.busy ? ' disabled' : ''}>취소</button>
       ${cutMode
         ? `<button type="button" class="btn sm ghost" data-action="ph-orig"${ed.busy ? ' disabled' : ''}>원본으로</button>`
-        : `<button type="button" class="btn sm ghost" data-action="ph-cut"${ed.busy || !ed.orig ? ' disabled' : ''}>✂ 인물만 남기기</button>`}
+        : `<button type="button" class="btn sm ghost" data-action="ph-cut"${ed.busy || !ed.orig ? ' disabled' : ''}>✂ 인물 스티커</button>`}
       <button type="button" class="btn sm" data-action="ph-ok"${ed.busy || !src ? ' disabled' : ''}>이 사진 추가</button>
     </div>`;
   if (!box.dataset.shown) { box.dataset.shown = '1'; box.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
@@ -1047,35 +1099,111 @@ async function cutoutPerson(img) {
     if (m) { mw = m.width; mh = m.height; bg = m.getAsFloat32Array().slice(); }
   });
   if (!bg || !mw || !mh) throw new Error('mask');
+  // 1) 사람일 확률을 살짝 흐려서 계단 모양 경계를 없앰
+  let fp = new Float32Array(mw * mh);
+  for (let i = 0; i < fp.length; i++) fp[i] = 1 - bg[i];
+  fp = blurMask(blurMask(fp, mw, mh), mw, mh);
+  // 2) 따로 떨어진 작은 조각(배경 오인식)은 지우고 큰 덩어리(사람)만 남김
+  if (!keepMainBlobs(fp, mw, mh)) return '';
+  // 3) 사진 크기로 부드럽게 키운 뒤 경계를 또렷하게
+  const W = c.width, H = c.height;
   const a = document.createElement('canvas');
   a.width = mw; a.height = mh;
-  const ag = a.getContext('2d');
-  const id = ag.createImageData(mw, mh);
-  let fg = 0, x0 = mw, y0 = mh, x1 = -1, y1 = -1;
-  for (let y = 0; y < mh; y++) {
-    for (let x = 0; x < mw; x++) {
-      const i = y * mw + x;
-      const v = Math.max(0, Math.min(1, (0.8 - bg[i]) / 0.6)); // 경계를 부드럽게
-      if (v > 0.05) { fg++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
-      id.data[i * 4 + 3] = Math.round(v * 255);
+  const id = a.getContext('2d').createImageData(mw, mh);
+  for (let i = 0; i < fp.length; i++) id.data[i * 4 + 3] = Math.round(fp[i] * 255);
+  a.getContext('2d').putImageData(id, 0, 0);
+  const up = document.createElement('canvas');
+  up.width = W; up.height = H;
+  const ug = up.getContext('2d');
+  ug.imageSmoothingQuality = 'high';
+  ug.drawImage(a, 0, 0, W, H);
+  const ua = ug.getImageData(0, 0, W, H).data;
+  const cg = c.getContext('2d');
+  const px = cg.getImageData(0, 0, W, H);
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      let v = (ua[i + 3] / 255 - 0.42) / 0.2; // 0.42~0.62 사이만 반투명 → 깔끔한 가장자리
+      v = v <= 0 ? 0 : v >= 1 ? 1 : v * v * (3 - 2 * v);
+      px.data[i + 3] = Math.round(v * 255);
+      if (v > 0.02) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
     }
   }
-  if (fg < mw * mh * 0.01) return '';
-  ag.putImageData(id, 0, 0);
-  const o = document.createElement('canvas');
-  o.width = c.width; o.height = c.height;
-  const og = o.getContext('2d');
-  og.drawImage(c, 0, 0);
-  og.globalCompositeOperation = 'destination-in';
-  og.drawImage(a, 0, 0, c.width, c.height);
-  // 사람 주변만 잘라서 용량 절약
-  const sx = c.width / mw, sy = c.height / mh, pad = Math.round(Math.max(c.width, c.height) * 0.03);
-  const cx0 = Math.max(0, Math.floor(x0 * sx) - pad), cy0 = Math.max(0, Math.floor(y0 * sy) - pad);
-  const cx1 = Math.min(c.width, Math.ceil((x1 + 1) * sx) + pad), cy1 = Math.min(c.height, Math.ceil((y1 + 1) * sy) + pad);
-  const k = document.createElement('canvas');
-  k.width = cx1 - cx0; k.height = cy1 - cy0;
-  k.getContext('2d').drawImage(o, cx0, cy0, k.width, k.height, 0, 0, k.width, k.height);
-  return encodeFit(toCanvas(k, 900), true);
+  if (x1 < 0) return '';
+  cg.putImageData(px, 0, 0);
+  // 4) 사람 부분만 잘라 냄
+  const pw = x1 - x0 + 1, ph = y1 - y0 + 1;
+  const person = document.createElement('canvas');
+  person.width = pw; person.height = ph;
+  person.getContext('2d').drawImage(c, x0, y0, pw, ph, 0, 0, pw, ph);
+  // 5) 흰 테두리(스티커): 흰색 실루엣을 둥글게 돌려 찍어 두께를 만든 뒤 사람을 위에 올림
+  const r = Math.max(5, Math.min(22, Math.round(Math.max(pw, ph) * 0.022)));
+  const pad = r + 2;
+  const sil = document.createElement('canvas');
+  sil.width = pw; sil.height = ph;
+  const sg = sil.getContext('2d');
+  sg.drawImage(person, 0, 0);
+  sg.globalCompositeOperation = 'source-in';
+  sg.fillStyle = '#fff';
+  sg.fillRect(0, 0, pw, ph);
+  const out = document.createElement('canvas');
+  out.width = pw + pad * 2; out.height = ph + pad * 2;
+  const og = out.getContext('2d');
+  [[r, 28], [r * 0.6, 16], [r * 0.3, 8]].forEach(([rad, n]) => {
+    for (let s = 0; s < n; s++) {
+      const t = (s / n) * Math.PI * 2;
+      og.drawImage(sil, pad + Math.cos(t) * rad, pad + Math.sin(t) * rad);
+    }
+  });
+  og.drawImage(person, pad, pad);
+  return encodeFit(toCanvas(out, 900), true);
+}
+function blurMask(src, w, h) { // 3x3 평균 흐림
+  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    tmp[i] = (src[x > 0 ? i - 1 : i] + src[i] + src[x < w - 1 ? i + 1 : i]) / 3;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    out[i] = (tmp[y > 0 ? i - w : i] + tmp[i] + tmp[y < h - 1 ? i + w : i]) / 3;
+  }
+  return out;
+}
+function keepMainBlobs(fp, w, h) { // 가장 큰 덩어리의 15% 미만인 조각은 제거. 사람이 없으면 false
+  const lab = new Int32Array(w * h), sizes = [0];
+  const stack = [];
+  for (let s = 0; s < lab.length; s++) {
+    if (lab[s] || fp[s] < 0.5) continue;
+    const id = sizes.length;
+    let n = 0;
+    lab[s] = id; stack.push(s);
+    while (stack.length) {
+      const i = stack.pop(); n++;
+      const x = i % w;
+      const nb = [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w];
+      for (const j of nb) if (j >= 0 && j < lab.length && !lab[j] && fp[j] >= 0.5) { lab[j] = id; stack.push(j); }
+    }
+    sizes.push(n);
+  }
+  const big = Math.max(0, ...sizes);
+  if (big < w * h * 0.01) return false;
+  const keep = sizes.map(n => n >= big * 0.15);
+  // 지운 조각 둘레의 옅은 부분까지 함께 지움(2칸)
+  const drop = new Uint8Array(w * h);
+  for (let i = 0; i < lab.length; i++) if (lab[i] && !keep[lab[i]]) drop[i] = 1;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (lab[i] && keep[lab[i]]) continue;
+    let near = false;
+    for (let dy = -2; dy <= 2 && !near; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const yy = y + dy, xx = x + dx;
+      if (yy >= 0 && yy < h && xx >= 0 && xx < w && drop[yy * w + xx]) { near = true; break; }
+    }
+    if (near || drop[i]) fp[i] = 0;
+  }
+  return true;
 }
 
 /* =====================================================================
@@ -1589,7 +1717,9 @@ const actions = {
     const cut = ed.mode === 'cut' && !!ed.cut;
     const d = cut ? ed.cut : ed.orig;
     if (!d) return;
-    sheetCtx.photos.push({ id: uid(), cut, data: d, isNew: true });
+    const p = { id: uid(), cut, data: d, isNew: true };
+    sheetCtx.photos.push(p);
+    needThumb(p);
     sheetCtx.edit = null;
     renderPhotoEdit(); renderPhotoRow();
   },
@@ -1683,13 +1813,19 @@ const forms = {
       if (sheetCtx.edit && !sheetCtx.edit.busy && (sheetCtx.edit.orig || sheetCtx.edit.cut)) {
         toast('미리보기 중인 사진은 "이 사진 추가"를 눌러야 들어가요'); return;
       }
+      const pend = sheetCtx.photos.map(p => p.tp).filter(Boolean);
+      if (pend.length) { // 달력용 미리보기를 다 만든 뒤 저장
+        const ctx = sheetCtx;
+        Promise.all(pend).then(() => { if (sheetCtx === ctx) forms.event(f, fd); });
+        return;
+      }
       if (!canWrite()) return;
       sheetCtx.photos.filter(p => p.isNew && p.data).forEach(p => {
         p.isNew = false;
         savePhoto({ id: p.id, eventId: doc.id, data: p.data, cut: p.cut, by: settings.me, createdAt: Date.now() })
           .catch(() => { if (!cloud.on) toast('이 기기에 사진을 저장하지 못했어요 (저장 공간 확인)'); });
       });
-      doc.photos = sheetCtx.photos.map(p => ({ id: p.id, cut: !!p.cut }));
+      doc.photos = sheetCtx.photos.map(p => (p.t ? { id: p.id, cut: !!p.cut, t: p.t } : { id: p.id, cut: !!p.cut }));
     }
     if (!putDoc('events', doc)) return;
     (sheetCtx.removed || []).forEach(removePhoto);
